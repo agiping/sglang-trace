@@ -83,6 +83,7 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import (
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.observability import shadow_trace as _shadow_trace
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     convert_time_to_realtime,
@@ -144,6 +145,9 @@ class ReqState:
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
+
+    # Fault-driven shadow trace (tokenizer-side; independent ring per rid).
+    shadow_trace: Optional["_shadow_trace.ShadowTrace"] = None
 
     # For streaming output
     last_output_offset: int = 0
@@ -227,6 +231,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         set_global_server_args_for_tokenizer(server_args)
+
+        # Initialize fault-driven shadow trace (no-op unless env enabled)
+        _shadow_trace.init_shadow_trace(role="tokenizer")
 
         # Init model config
         self.init_model_config()
@@ -1067,6 +1074,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+        _state = self.rid_to_state[obj.rid]
+        if _state.shadow_trace is not None:
+            _state.shadow_trace.event(
+                _shadow_trace.STAGE_TOKENIZE,
+                input_ids_len=(
+                    len(tokenized_obj.input_ids)
+                    if hasattr(tokenized_obj, "input_ids")
+                    and tokenized_obj.input_ids is not None
+                    else 0
+                ),
+            )
 
         return tokenized_obj
 
@@ -1255,6 +1273,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             finish_reason.get("type") == "abort"
             and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
         ):
+            if state.shadow_trace is not None:
+                state.shadow_trace.event(
+                    _shadow_trace.STAGE_ABORT_FROM_SCHED,
+                    status_code=int(HTTPStatus.BAD_REQUEST),
+                    msg=finish_reason.get("message"),
+                )
+                _shadow_trace.submit_fault(
+                    state.shadow_trace,
+                    verdict="fault",
+                    finish_reason=finish_reason,
+                    is_stream=is_stream,
+                )
+                state.shadow_trace = None
             if not is_stream:
                 raise ValueError(finish_reason["message"])
             return out
@@ -1265,6 +1296,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ):
+            if state.shadow_trace is not None:
+                state.shadow_trace.event(
+                    _shadow_trace.STAGE_ABORT_FROM_SCHED,
+                    status_code=int(finish_reason.get("status_code", 0)),
+                    msg=finish_reason.get("message"),
+                )
+                _shadow_trace.submit_fault(
+                    state.shadow_trace,
+                    verdict="fault",
+                    finish_reason=finish_reason,
+                    is_stream=is_stream,
+                )
+                state.shadow_trace = None
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
             if state.obj.rid in self.rid_to_state:
@@ -1848,6 +1892,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+                # Tokenizer-side normal finish: dump if sampled, drop otherwise.
+                if state.shadow_trace is not None:
+                    fr = meta_info.get("finish_reason") or {}
+                    is_err = bool(
+                        isinstance(fr, dict) and fr.get("type") == "abort"
+                    )
+                    if not is_err:
+                        state.shadow_trace.event(
+                            _shadow_trace.STAGE_HTTP_RESPOND,
+                            e2e_latency=meta_info.get("e2e_latency"),
+                        )
+                        _shadow_trace.submit_normal_or_drop(
+                            state.shadow_trace,
+                            finish_reason=fr,
+                        )
+                    state.shadow_trace = None
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
@@ -2599,6 +2659,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.server_args.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            # Fault-driven shadow trace (independent of OTLP trace_ctx above).
+            state.shadow_trace = _shadow_trace.new_trace(
+                rid=rid,
+                role="tokenizer",
+                bootstrap_room=bootstrap_room,
+            )
+            if state.shadow_trace is not None:
+                state.shadow_trace.event(
+                    _shadow_trace.STAGE_HTTP_ARRIVE,
+                    has_request=request is not None,
+                )
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

@@ -633,6 +633,9 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
 
     # populate finish metadata and stream output
     req.finished_reason = FINISH_ABORT(error_message, status_code)
+    # Dispatch shadow trace on this direct-finish path too.
+    if getattr(req, "shadow_trace", None) is not None:
+        req._dispatch_shadow_trace_on_finish()
 
     if req.return_logprob:
         req.input_token_logprobs_val = []

@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.observability import shadow_trace as _shadow_trace
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     get_global_indexer_capturer,
@@ -249,6 +250,14 @@ class SchedulerOutputProcessorMixin:
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
+                    if req.shadow_trace is not None:
+                        req.shadow_trace.event(
+                            _shadow_trace.STAGE_PREFILL_FINISH,
+                            extend_input_len=getattr(req, "extend_input_len", 0),
+                            batch_size=len(batch.reqs),
+                            first_tok=int(next_token_id),
+                        )
+
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
@@ -314,6 +323,12 @@ class SchedulerOutputProcessorMixin:
 
                 else:
                     # being chunked reqs' prefill is not finished
+                    if req.shadow_trace is not None:
+                        req.shadow_trace.event(
+                            _shadow_trace.STAGE_PREFILL_CHUNK,
+                            remaining_chunks=req.is_chunked,
+                            batch_size=len(batch.reqs),
+                        )
                     req.is_chunked -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
@@ -561,6 +576,21 @@ class SchedulerOutputProcessorMixin:
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
+            if req.shadow_trace is not None:
+                # token_id may be a list (spec v2) — record accepted length and last id.
+                if isinstance(next_token_id, list):
+                    last_tok = int(next_token_id[-1]) if next_token_id else 0
+                    accepted = len(next_token_id)
+                else:
+                    last_tok = int(next_token_id)
+                    accepted = 1
+                req.shadow_trace.decode_step(
+                    step_idx=len(req.output_ids),
+                    bsz=len(batch.reqs),
+                    token_id=last_tok,
+                    fwd_us=accepted,  # repurpose: # accepted tokens this step
+                    retracted=int(req.is_retracted),
+                )
             req.check_finished(new_accepted_len)
 
             self._handle_finished_req(req, i, logits_output)

@@ -60,6 +60,7 @@ from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.observability import shadow_trace as _shadow_trace
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -621,6 +622,25 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
     ):
+        # Fault-driven shadow trace (per-request ring; None when disabled or
+        # not sampled and no fault yet — writers must None-check).
+        self.shadow_trace = _shadow_trace.new_trace(
+            rid=rid,
+            role=(
+                "prefill"
+                if disagg_mode == DisaggregationMode.PREFILL
+                else "decode"
+                if disagg_mode == DisaggregationMode.DECODE
+                else "scheduler"
+            ),
+            bootstrap_room=bootstrap_room,
+        )
+        if self.shadow_trace is not None:
+            self.shadow_trace.event(
+                _shadow_trace.STAGE_REQ_RECEIVED,
+                input_len=len(origin_input_ids) if origin_input_ids else 0,
+            )
+
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
@@ -1217,6 +1237,7 @@ class Req(ReqDllmMixin):
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None
+            self._dispatch_shadow_trace_on_finish()
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
@@ -1224,28 +1245,73 @@ class Req(ReqDllmMixin):
                 length=self.sampling_params.max_new_tokens
             )
             self.finished_len = self.sampling_params.max_new_tokens
+            self._dispatch_shadow_trace_on_finish()
             return
 
         if self.grammar is not None:
             if self.grammar.is_terminated():
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+                self._dispatch_shadow_trace_on_finish()
                 return
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         if self._check_token_based_finish(new_accepted_tokens):
+            self._dispatch_shadow_trace_on_finish()
             return
 
         if self._check_vocab_boundary_finish(new_accepted_tokens):
+            self._dispatch_shadow_trace_on_finish()
             return
 
         if self._check_str_based_finish():
+            self._dispatch_shadow_trace_on_finish()
             return
+
+    def _dispatch_shadow_trace_on_finish(self) -> None:
+        st = self.shadow_trace
+        if st is None:
+            return
+        fr = self.finished_reason
+        is_error = bool(fr is not None and fr.is_error)
+        if is_error:
+            status_code = getattr(fr, "status_code", None)
+            st.event(
+                _shadow_trace.STAGE_ABORT_COMMIT,
+                reason=type(fr).__name__,
+                status_code=int(status_code) if status_code is not None else None,
+            )
+            _shadow_trace.submit_fault(
+                st,
+                verdict="fault",
+                finish_reason_type=type(fr).__name__,
+                finish_status_code=int(status_code) if status_code is not None else None,
+                output_len=len(self.output_ids),
+            )
+        else:
+            stage = (
+                _shadow_trace.STAGE_FINISH_LENGTH
+                if isinstance(fr, FINISH_LENGTH)
+                else _shadow_trace.STAGE_FINISH_NORMAL
+            )
+            st.event(stage, output_len=len(self.output_ids))
+            _shadow_trace.submit_normal_or_drop(
+                st,
+                finish_reason_type=type(fr).__name__ if fr is not None else "unknown",
+                output_len=len(self.output_ids),
+            )
+        # release ASAP (drop ring memory whether dumped or not)
+        self.shadow_trace = None
 
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        if self.shadow_trace is not None:
+            self.shadow_trace.event(
+                _shadow_trace.STAGE_RETRACT,
+                count=self.retraction_count,
+            )
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
@@ -1353,6 +1419,12 @@ class Req(ReqDllmMixin):
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+        if self.shadow_trace is not None:
+            self.shadow_trace.event(
+                _shadow_trace.STAGE_ABORT_SET,
+                msg=error_msg,
+                status_code=int(HTTPStatus.BAD_REQUEST),
+            )
 
     def update_reasoning_tokens(self, token_id, think_end_id):
         if self._is_reasoning_over:

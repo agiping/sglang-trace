@@ -352,6 +352,19 @@ class Scheduler(
         self.is_initializing = True
         self.init_soft_watchdog(server_args)
 
+        # Init fault-driven shadow trace (no-op unless env enabled).
+        # Role reflects PD-disagg mode when applicable; "scheduler" otherwise.
+        from sglang.srt.observability import shadow_trace as _shadow_trace_mod
+
+        _disagg_role = (
+            "prefill"
+            if getattr(server_args, "disaggregation_mode", None) == "prefill"
+            else "decode"
+            if getattr(server_args, "disaggregation_mode", None) == "decode"
+            else "scheduler"
+        )
+        _shadow_trace_mod.init_shadow_trace(role=_disagg_role)
+
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
